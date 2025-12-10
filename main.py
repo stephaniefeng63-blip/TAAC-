@@ -1,5 +1,5 @@
 # main_infonce_patch.py —— InfoNCE + action_type inspect + flexible action weighting
-# 已新增：时间/点击特征参数，硬负例开关 (--hard_negatives)，可选 AMP (--amp)
+# 新增：时间/点击特征参数，困难负开关 (--hard_negatives)，可选 AMP (--amp)
 import argparse
 import json
 import os
@@ -89,7 +89,7 @@ def get_args():
     parser.add_argument('--feat_ctr_short_k', default=5, type=int, help='recent short-window CTR length')
     parser.add_argument('--feat_ctr_long_k', default=50, type=int, help='recent long-window CTR length')
 
-    # ===== 新增：硬负例开关 & AMP =====
+    # ===== 新增：困难负开关 & AMP =====
     parser.add_argument('--hard_negatives', action='store_true', help='use in-batch positives as negatives (NxN InfoNCE)')
     parser.add_argument('--amp', action='store_true', help='enable mixed precision training')
 
@@ -120,7 +120,7 @@ def parse_weight_map(map_str):
 
 def compute_infonce_loss(seq_q, pos_t, neg_pool, temp=0.07, eps=1e-8, sample_weights=None, temp_boost=0.0):
     """
-    标准版：每个样本独立的 in-batch neg_pool（通常较“易”）
+    每个样本独立的 in-batch neg_pool
     seq_q: [N, H]
     pos_t: [N, H]
     neg_pool: [N, H] or [M, H]
@@ -158,7 +158,7 @@ def compute_infonce_loss(seq_q, pos_t, neg_pool, temp=0.07, eps=1e-8, sample_wei
 
 def compute_infonce_loss_hard(seq_q, pos_t, temp=0.07, sample_weights=None):
     """
-    硬负例版：使用整个 batch 的正样本作为负样本（除对角），更难
+    使用整个 batch 的正样本作为负样本，更困难
     seq_q: [N, H], pos_t: [N, H]
     """
     seq_q = F.normalize(seq_q, dim=-1)
