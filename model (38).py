@@ -1,4 +1,4 @@
-# model.py （已改动：将时间特征融合点前移至物品侧）
+# model.py （将时间特征融合点前移至物品侧）
 # 变更要点：
 # 1) 在 __init__ 中：
 #    - 计算所有时间特征的总维度 time_feature_dim。
@@ -20,9 +20,7 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
-# FlashMultiHeadAttention 和 PointWiseFeedForward 类保持不变
 class FlashMultiHeadAttention(torch.nn.Module):
-    # ... 代码未变 ...
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
 
@@ -77,7 +75,6 @@ class FlashMultiHeadAttention(torch.nn.Module):
         return output, None
 
 class PointWiseFeedForward(torch.nn.Module):
-    # ... 代码未变 ...
     def __init__(self, hidden_units, dropout_rate):
         super(PointWiseFeedForward, self).__init__()
 
@@ -116,7 +113,7 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
-        # ===== 【修改点 1】为时间特征准备信息，并扩充 itemdim =====
+        # ===== 为时间特征准备信息，并扩充 itemdim =====
         self.time_dense_keys = [
             'u_sin_hour','u_cos_hour','u_sin_dow','u_cos_dow',
             'u_log_time_gap','u_recent_ctr_s','u_recent_ctr_l','u_session_pos'
@@ -157,8 +154,7 @@ class BaselineModel(torch.nn.Module):
         # itemdnn 的输入维度变大了
         self.itemdnn = torch.nn.Linear(itemdim_with_time, args.hidden_units) 
         
-        # ===== 【修改点 2】移除独立的 timednn =====
-        # self.timednn 相关的代码已被删除
+        # ===== 移除独立的 timednn =====
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
@@ -185,7 +181,6 @@ class BaselineModel(torch.nn.Module):
 
 
     def _init_feat_info(self, feat_statistics, feat_types):
-        # ... 代码未变 ...
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
         self.USER_CONTINUAL_FEAT = feat_types['user_continual']
         self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
@@ -196,7 +191,6 @@ class BaselineModel(torch.nn.Module):
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}
 
     def feat2tensor(self, seq_feature, k):
-        # ... 代码未变 ...
         batch_size = len(seq_feature)
 
         if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
@@ -265,9 +259,9 @@ class BaselineModel(torch.nn.Module):
             tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
             item_feat_list.append(self.emb_transform[k](tensor_feature))
 
-        # ===== 【修改点 3】将时间特征提取并拼接到 item_feat_list 中 =====
-        # 注意：无论include_user是True还是False，我们都为物品序列添加时间上下文
-        # 因为候选物品（include_user=False）也需要知道它是在什么时间被推荐的
+        # ===== 将时间特征提取并拼接到 item_feat_list 中 =====
+        # 注意：无论include_user是True还是False，都为物品序列添加时间上下文
+        # 候选物品（include_user=False）也需要知道它是在什么时间被推荐的
         batch_size = len(feature_array)
         seq_len = len(feature_array[0]) if batch_size > 0 else 0
         
@@ -317,12 +311,11 @@ class BaselineModel(torch.nn.Module):
         else:
             seqs_emb = all_item_emb
         
-        # ===== 【修改点 4】移除了末尾的 time_vec 残差连接 =====
+        # ===== 移除了末尾的 time_vec 残差连接 =====
         return seqs_emb
 
     # log2feats, forward, predict, save_item_emb 等方法保持不变
     def log2feats(self, log_seqs, mask, seq_feature):
-        # ... 代码未变 ...
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
@@ -356,20 +349,17 @@ class BaselineModel(torch.nn.Module):
     def forward(
         self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
     ):
-        # ... 代码未变 ...
         log_feats = self.log2feats(user_item, mask, seq_feature)
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
         return log_feats, pos_embs, neg_embs
 
     def predict(self, log_seqs, seq_feature, mask):
-        # ... 代码未变 ...
         log_feats = self.log2feats(log_seqs, mask, seq_feature)
         final_feat = log_feats[:, -1, :]
         return final_feat
 
     def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
-        # ... 代码未变 ...
         all_embs = []
         for start_idx in tqdm(range(0, len(item_ids), batch_size), desc="Saving item embeddings"):
             end_idx = min(start_idx + batch_size, len(item_ids))
