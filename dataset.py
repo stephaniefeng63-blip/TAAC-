@@ -5,7 +5,7 @@
 #      u_time_bucket6_i(1..6，四小时分桶), u_is_weekend_i(1/2)
 # 2) 这些键仅在 model.feat2emb 的时间支路里手动读取，不加入 feature_types，
 #    因此不影响 indexer 与 fill_missing_feat 的默认补全逻辑。
-# 3) 你原有的连续时间/点击侧（8 个）仍保留在 user_continual 中。
+# 3) 原有的连续时间/点击侧（8个）仍保留在 user_continual 中。
 # ============================
 
 import json
@@ -62,15 +62,8 @@ class MyDataset(torch.utils.data.Dataset):
         return t
 
     def __getitem__(self, uid):
-        """
-        稳健版：
-        - 逐记录派生 8 个 user_continual 连续特征（时间 + 点击侧），字段缺失自动降级为 0
-        - 新增：离散时间桶索引（hour/dow/month/week/year/6桶/周末），1-based；0=缺省
-        - 其它逻辑（采样/掩码/三元组）与原实现一致
-        """
+        ""
         user_sequence = self._load_user_data(uid)
-
-        # ---- 1) 逐记录派生：容错解析字段（无 ts 也不炸）----
         from collections import deque
         import math
         import time as _time
@@ -169,7 +162,7 @@ class MyDataset(torch.utils.data.Dataset):
             dq_s.append(act)
             dq_l.append(act)
 
-        # ---- 2) 构造扩展序列（与你原逻辑一致），把 derived 合并进 feat ----
+        # ---- 2) 构造扩展序列，把 derived 合并进 feat ----
         ext_user_sequence = []
         for idx, record_tuple in enumerate(user_sequence):
             u = record_tuple[0] if len(record_tuple) > 0 else 0
@@ -185,7 +178,7 @@ class MyDataset(torch.utils.data.Dataset):
             if i and item_feat:
                 ext_user_sequence.append((i, item_feat, 1, action_type, ts, derived))
 
-        # 注意：保持和你原先一致的下游三元组/掩码/采样逻辑
+        # 注意：下游三元组/掩码/采样逻辑
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
         neg = np.zeros([self.maxlen + 1], dtype=np.int32)
