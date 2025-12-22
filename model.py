@@ -1,36 +1,18 @@
-# model.py （将时间特征融合点前移至物品侧）
-# 变更要点：
-# 1) 在 __init__ 中：
-#    - 计算所有时间特征的总维度 time_feature_dim。
-#    - 将 time_feature_dim 加入到 itemdim 的计算中，为 itemdnn 扩容。
-#    - 移除了独立的 self.timednn。
-# 2) 在 feat2emb 中：
-#    - 将时间特征（连续+离散桶）的提取逻辑，从函数末尾移到物品特征处理部分。
-#    - 将提取出的时间特征向量，拼接到 item_feat_list 中。
-#    - 所有拼接后的特征统一通过 self.itemdnn 进行融合。
-#    - 移除了函数末尾的 time_vec 残差连接。
-# ============================
-
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from dataset import save_emb
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
-
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
-
         self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
@@ -38,46 +20,33 @@ class FlashMultiHeadAttention(torch.nn.Module):
 
     def forward(self, query, key, value, attn_mask=None):
         batch_size, seq_len, _ = query.size()
-
-        # 计算Q, K, V
         Q = self.q_linear(query)
         K = self.k_linear(key)
         V = self.v_linear(value)
-
-        # reshape为multi-head格式
         Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if hasattr(F, 'scaled_dot_product_attention'):
-            # PyTorch 2.0+ 使用内置的Flash Attention
             attn_output = F.scaled_dot_product_attention(
                 Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1) if attn_mask is not None else None
             )
         else:
-            # 降级到标准注意力机制
             scale = (self.head_dim) ** -0.5
             scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
-
             if attn_mask is not None:
                 scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
-
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
             attn_output = torch.matmul(attn_weights, V)
 
-        # reshape回原来的格式
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-
-        # 最终的线性变换
         output = self.out_linear(attn_output)
-
         return output, None
 
 class PointWiseFeedForward(torch.nn.Module):
     def __init__(self, hidden_units, dropout_rate):
         super(PointWiseFeedForward, self).__init__()
-
         self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
         self.dropout1 = torch.nn.Dropout(p=dropout_rate)
         self.relu = torch.nn.ReLU()
@@ -86,13 +55,12 @@ class PointWiseFeedForward(torch.nn.Module):
 
     def forward(self, inputs):
         outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
+        outputs = outputs.transpose(-1, -2) 
         return outputs
 
 class BaselineModel(torch.nn.Module):
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
         super(BaselineModel, self).__init__()
-
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
@@ -113,10 +81,9 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
-        # ===== 为时间特征准备信息，并扩充 itemdim =====
         self.time_dense_keys = [
             'u_sin_hour','u_cos_hour','u_sin_dow','u_cos_dow',
-            'u_log_time_gap','u_recent_ctr_s','u_recent_ctr_l','u_session_pos'
+            'u_log_time_gap','u_session_pos','u_smooth_ctr'
         ]
         time_dense_dim = len(self.time_dense_keys)
 
@@ -134,39 +101,27 @@ class BaselineModel(torch.nn.Module):
             k: torch.nn.Embedding(vocab + 1, dim, padding_idx=0)
             for k, (vocab, dim) in self.time_bucket_info.items()
         })
-        # 计算所有时间特征拼接后的总维度
         time_feature_dim = time_dense_dim + sum(dim for (_, dim) in self.time_bucket_info.values())
 
-        # 定义用户和物品原始特征的维度
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
-            self.USER_CONTINUAL_FEAT
-        )
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(self.USER_CONTINUAL_FEAT)
+        
         itemdim = (
             args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
             + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
-        
-        # 将时间特征维度加入到 itemdim 中
         itemdim_with_time = itemdim + time_feature_dim
 
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
-        # itemdnn 的输入维度变大了
         self.itemdnn = torch.nn.Linear(itemdim_with_time, args.hidden_units) 
-        
-        # ===== 移除独立的 timednn =====
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
-            new_attn_layer = FlashMultiHeadAttention(args.hidden_units, args.num_heads, args.dropout_rate)
-            self.attention_layers.append(new_attn_layer)
-            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
-            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
+            self.attention_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
+            self.attention_layers.append(FlashMultiHeadAttention(args.hidden_units, args.num_heads, args.dropout_rate))
+            self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
+            self.forward_layers.append(PointWiseFeedForward(args.hidden_units, args.dropout_rate))
 
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
@@ -178,7 +133,6 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-
 
     def _init_feat_info(self, feat_statistics, feat_types):
         self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
@@ -192,32 +146,26 @@ class BaselineModel(torch.nn.Module):
 
     def feat2tensor(self, seq_feature, k):
         batch_size = len(seq_feature)
-
         if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
             max_array_len = 0
             max_seq_len = 0
-
             for i in range(batch_size):
                 seq_data = [item[k] for item in seq_feature[i]]
                 max_seq_len = max(max_seq_len, len(seq_data))
                 max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
-
             batch_data = np.zeros((batch_size, max_seq_len, max_array_len), dtype=np.int64)
             for i in range(batch_size):
                 seq_data = [item[k] for item in seq_feature[i]]
                 for j, item_data in enumerate(seq_data):
                     actual_len = min(len(item_data), max_array_len)
                     batch_data[i, j, :actual_len] = item_data[:actual_len]
-
             return torch.from_numpy(batch_data).to(self.dev)
         else:
             max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
             batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
-
             for i in range(batch_size):
                 seq_data = [item[k] for item in seq_feature[i]]
                 batch_data[i] = seq_data
-
             return torch.from_numpy(batch_data).to(self.dev)
 
     def feat2emb(self, seq, feature_array, mask=None, include_user=False):
@@ -233,7 +181,6 @@ class BaselineModel(torch.nn.Module):
             item_embedding = self.item_emb(seq)
             item_feat_list = [item_embedding]
 
-        # 物品侧特征（ID、稀疏、多值、连续）
         for k in self.ITEM_SPARSE_FEAT:
             tensor_feature = self.feat2tensor(feature_array, k)
             item_feat_list.append(self.sparse_emb[k](tensor_feature))
@@ -242,11 +189,9 @@ class BaselineModel(torch.nn.Module):
             item_feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
         for k in self.ITEM_CONTINUAL_FEAT:
             tensor_feature = self.feat2tensor(feature_array, k)
-            item_feat_list.append(tensor_feature.unsqueeze(2))
+            item_feat_list.append(tensor_feature.unsqueeze(2).float())
         
-        # 物品侧多模态 emb 线性映射
         for k in self.ITEM_EMB_FEAT:
-            # ... (这部分逻辑未变)
             batch_size = len(feature_array)
             emb_dim = self.ITEM_EMB_FEAT[k]
             seq_len = len(feature_array[0]) if batch_size > 0 else 0
@@ -259,13 +204,9 @@ class BaselineModel(torch.nn.Module):
             tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
             item_feat_list.append(self.emb_transform[k](tensor_feature))
 
-        # ===== 将时间特征提取并拼接到 item_feat_list 中 =====
-        # 注意：无论include_user是True还是False，都为物品序列添加时间上下文
-        # 候选物品（include_user=False）也需要知道它是在什么时间被推荐的
         batch_size = len(feature_array)
         seq_len = len(feature_array[0]) if batch_size > 0 else 0
         
-        # 1) 连续时间向量 [B,T,D_dense]
         dense_arr = np.zeros((batch_size, seq_len, len(self.time_dense_keys)), dtype=np.float32)
         for bi in range(batch_size):
             seq_feats = feature_array[bi]
@@ -276,7 +217,6 @@ class BaselineModel(torch.nn.Module):
         time_dense = torch.from_numpy(dense_arr).to(self.dev)
         item_feat_list.append(time_dense)
 
-        # 2) 离散桶 embedding 汇总
         for k in self.time_bucket_info:
             idx_np = np.zeros((batch_size, seq_len), dtype=np.int64)
             for bi in range(batch_size):
@@ -287,7 +227,6 @@ class BaselineModel(torch.nn.Module):
             bucket_emb = self.time_bucket_embs[k](idx_tensor)
             item_feat_list.append(bucket_emb)
         
-        # 用户侧特征（仅在 include_user 时处理）
         if include_user:
             for k in self.USER_SPARSE_FEAT:
                 tensor_feature = self.feat2tensor(feature_array, k)
@@ -297,10 +236,8 @@ class BaselineModel(torch.nn.Module):
                 user_feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
             for k in self.USER_CONTINUAL_FEAT:
                 tensor_feature = self.feat2tensor(feature_array, k)
-                user_feat_list.append(tensor_feature.unsqueeze(2))
+                user_feat_list.append(tensor_feature.unsqueeze(2).float())
 
-        # ====== 拼接与融合 ======
-        # 将所有物品侧特征（包括时间特征）拼接起来
         all_item_emb = torch.cat(item_feat_list, dim=2)
         all_item_emb = torch.relu(self.itemdnn(all_item_emb))
 
@@ -311,10 +248,8 @@ class BaselineModel(torch.nn.Module):
         else:
             seqs_emb = all_item_emb
         
-        # ===== 移除了末尾的 time_vec 残差连接 =====
         return seqs_emb
 
-    # log2feats, forward, predict, save_item_emb 等方法保持不变
     def log2feats(self, log_seqs, mask, seq_feature):
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
@@ -343,12 +278,9 @@ class BaselineModel(torch.nn.Module):
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
         log_feats = self.last_layernorm(seqs)
-
         return log_feats
 
-    def forward(
-        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
-    ):
+    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature):
         log_feats = self.log2feats(user_item, mask, seq_feature)
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
