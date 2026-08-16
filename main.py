@@ -39,6 +39,7 @@ def get_args():
     parser.add_argument('--warmup_steps', default=1000, type=int)
     parser.add_argument('--temp', default=0.03, type=float)
     parser.add_argument('--amp', action='store_true', help='enable mixed precision training')
+    parser.add_argument('--accum_steps', default=1, type=int, help='gradient accumulation steps')
     
     parser.add_argument('--feat_session_gap', default=1800, type=int)
 
@@ -203,17 +204,26 @@ if __name__ == '__main__':
             writer.add_scalar('Loss/train', float(loss.item()), global_step)
             global_step += 1
 
-            optimizer.zero_grad()
+            accum_steps = max(1, args.accum_steps)
+            is_accum_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader))
+            loss_scaled = loss / accum_steps
+
             if args.amp:
-                scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss_scaled).backward()
             else:
-                loss.backward()
+                loss_scaled.backward()
+
+            if is_accum_step:
+                if args.amp:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_norm)
-                optimizer.step()
-            scheduler.step()
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
 
         model.eval()
         valid_loss_sum = 0.0
