@@ -5,6 +5,20 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from dataset import save_emb
 
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, hidden_units, eps=1e-8):
+        super(RMSNorm, self).__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_units))
+        self.eps = eps
+
+    def forward(self, x):
+        dtype = x.dtype
+        xf = x.float()
+        rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (xf * rms).to(dtype) * self.weight.to(dtype)
+
+
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
@@ -115,12 +129,12 @@ class BaselineModel(torch.nn.Module):
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim_with_time, args.hidden_units) 
 
-        self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+        self.last_layernorm = RMSNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
-            self.attention_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
+            self.attention_layernorms.append(RMSNorm(args.hidden_units, eps=1e-8))
             self.attention_layers.append(FlashMultiHeadAttention(args.hidden_units, args.num_heads, args.dropout_rate))
-            self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
+            self.forward_layernorms.append(RMSNorm(args.hidden_units, eps=1e-8))
             self.forward_layers.append(PointWiseFeedForward(args.hidden_units, args.dropout_rate))
 
         for k in self.USER_SPARSE_FEAT:
