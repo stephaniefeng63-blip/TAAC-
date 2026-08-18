@@ -1,0 +1,266 @@
+<div align="center">
+
+# 2025 腾讯广告算法大赛(TAAC)RTB 序列召回方案
+
+基于统一用户-物品序列的 Transformer,面向 RTB 实时竞价广告创意召回
+
+统一序列建模 · 多模态融合 · 混合 InfoNCE 对比学习 · LogQ 校正 · FAISS ANN 召回
+
+</div>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-1.13+-ee4c2c.svg" alt="PyTorch">
+  <img src="https://img.shields.io/badge/Transformer-SASRec-9c27b0.svg" alt="Transformer">
+  <img src="https://img.shields.io/badge/Retrieval-FAISS_HNSW-00897b.svg" alt="FAISS">
+</p>
+
+---
+
+## 简介
+
+本项目是 **2025 腾讯广告算法大赛(Tencent Advertising Algorithm Competition, TAAC)** 赛题的召回侧解决方案,面向 **RTB(Real-Time Bidding)实时竞价广告** 的创意召回任务。
+
+赛题给定用户的历史广告交互序列(曝光、点击等行为),要求为每个用户从海量广告创意(candidate creative)中召回最相关的 Top-K。本仓库为召回阶段的模型实现。
+
+核心思路:把用户特征和物品交互行为交错拼接到同一条序列里,用一个 Transformer 同时建模「用户是谁」和「用户在做什么」,再以对比学习把序列表征对齐到物品 embedding 空间,推理时通过 FAISS 做近似最近邻(ANN)召回 Top-K 候选创意。相比传统双塔召回,该方案把用户静态画像、行为序列、时间上下文、多模态创意特征统一在一个自回归主干里,用一个模型一次性产出 query 向量和 item 向量。
+
+---
+
+## 核心特性
+
+### 模型主干
+
+- **SASRec 风格 Transformer**:RMSNorm + 多头自注意力 + Conv1d 前馈网络,支持 Pre-Norm / Post-Norm
+- **Flash Attention**:优先调用 `F.scaled_dot_product_attention`,无可用时回退到手动 softmax 实现
+- **统一用户-物品序列**:用户特征(token_type=2)与物品交互(token_type=1)交错入序,共享同一套注意力参数
+
+### 多字段特征融合
+
+| 特征类型 | 说明 |
+|---|---|
+| User Sparse | 用户侧离散特征(103 / 104 / 105 / 109),独立 embedding 表 |
+| Item Sparse | 物品侧离散特征(100 / 117 / 111 / 118 / 101 / 102 等 13 路) |
+| Array 特征 | 变长离散序列特征,pooling 后融合 |
+| 多模态创意 Embedding | 预训练 creative 向量(81~86,维度 32 / 1024 / 3584 / 4096),经线性投影对齐到隐藏维 |
+| 时间连续特征 | sin / cos 周期编码(小时 / 星期)、log 时间间隔、session 位置 |
+| 时间桶 Embedding | 小时 / 星期 / 月 / 周 / 年 / 时段 / 是否周末,离散桶嵌入 |
+| 贝叶斯平滑 CTR | 从原始曝光日志统计,按用户 / 物品计算平滑点击率作为连续特征 |
+
+### 训练目标
+
+- **混合 InfoNCE 对比损失**:1 : 1 配比的 Easy Negative(随机采样)+ Hard Negative(in-batch 其它正样本)
+- **LogQ 校正**:按物品流行度做 sampled-softmax 校正,缓解负样本采样偏差
+- **冲突掩码**:屏蔽自身、正样本与负样本 ID 相等等无效对
+
+### 训练工程
+
+- AdamW + 余弦退火 + Warmup 学习率调度
+- 混合精度(AMP)训练 + 梯度累积 + 梯度裁剪
+- 支持从 checkpoint 续训(自动解析 epoch)
+- TensorBoard 日志 + 每轮验证集评估 + checkpoint 命名含 valid_loss
+
+### 召回推理
+
+- 序列末位 hidden state 作为 query 向量;全量物品 embedding 作为 candidate 向量
+- L2 归一化后导出 `fbin` / `u64bin` 二进制向量格式
+- 调用 FAISS HNSW(M=64,ef_construction=1280,ef_search=640)召回 Top-10
+- 冷启动特征兜底处理(未知 string 特征置 0)
+
+---
+
+## 架构总览
+
+```mermaid
+flowchart LR
+    subgraph Data["数据层 (dataset.py)"]
+        A1[seq.jsonl 行为序列] --> A2[特征工程]
+        A3[item_feat_dict.json] --> A2
+        A4[creative_emb 多模态] --> A2
+        A5[ctr_stats.pkl 贝叶斯CTR] --> A2
+        A2 --> A6["统一用户-物品序列<br/>token_type 区分"]
+    end
+
+    subgraph Model["模型主干 (model.py) BaselineModel"]
+        A6 --> B1["多字段 Embedding 融合<br/>sparse / array / 多模态 / 时间"]
+        B1 --> B2[+ 位置编码]
+        B2 --> B3["Transformer × num_blocks<br/>RMSNorm + MHA + Conv1d FFN"]
+        B3 --> B4[log_feats 序列表征]
+    end
+
+    subgraph Train["训练 (main.py)"]
+        B4 --> C1["混合 InfoNCE<br/>Easy + Hard 1:1"]
+        C1 --> C2[LogQ 校正]
+        C2 --> C3["Cosine + Warmup<br/>AMP + 梯度累积"]
+    end
+
+    subgraph Infer["推理召回 (infer)"]
+        B4 --> D1[query.fbin 用户向量]
+        B4 --> D2[embedding.fbin 物品向量]
+        D1 & D2 --> D3["FAISS HNSW ANN"]
+        D3 --> D4[Top-10 creative_id]
+    end
+
+    Train -.-> Infer
+```
+
+---
+
+## 项目结构
+
+```
+TAAC--main/
+├── main.py        # 训练入口:数据加载、训练循环、验证、checkpoint 保存
+├── model.py       # BaselineModel:Transformer 主干 + 多字段特征融合
+├── dataset.py     # MyDataset / MyTestDataset:特征工程、序列构造、CTR 统计
+├── infer          # 推理脚本:导出向量 + FAISS ANN 召回 Top-10
+└── README.md
+```
+
+---
+
+## 快速开始
+
+### 环境变量
+
+训练和推理均通过环境变量配置路径:
+
+```bash
+# 训练
+export TRAIN_DATA_PATH=/path/to/data          # 数据目录(含 seq.jsonl 等)
+export TRAIN_LOG_PATH=/path/to/logs           # 训练日志目录
+export TRAIN_TF_EVENTS_PATH=/path/to/tb       # TensorBoard 事件目录
+export TRAIN_CKPT_PATH=/path/to/ckpt          # checkpoint 保存目录
+
+# 推理
+export EVAL_DATA_PATH=/path/to/eval_data      # 评测数据(含 predict_seq.jsonl, predict_set.jsonl)
+export EVAL_RESULT_PATH=/path/to/eval_result  # 推理结果输出目录
+export MODEL_OUTPUT_PATH=/path/to/ckpt        # 模型 checkpoint 目录
+```
+
+### 数据格式
+
+数据目录需包含:
+
+| 文件 | 说明 |
+|---|---|
+| `seq.jsonl` | 训练用户行为序列(每行一个用户的交互序列 JSON) |
+| `seq_offsets.pkl` | 用户序列在 jsonl 中的字节偏移索引 |
+| `predict_seq.jsonl` | 评测用户序列 |
+| `predict_seq_offsets.pkl` | 评测序列偏移 |
+| `predict_set.jsonl` | 候选物品集(含 creative_id / retrieval_id / features) |
+| `item_feat_dict.json` | 物品特征字典 |
+| `indexer.pkl` | 用户 / 物品 / 特征 ID 索引映射 |
+| `creative_emb/` | 多模态创意 embedding(81~86 各路) |
+| `ctr_stats.pkl` | 可选,缓存的 CTR 统计,不存在则从日志现算 |
+
+### 训练
+
+```bash
+python main.py \
+    --batch_size 256 \
+    --hidden_units 128 \
+    --num_blocks 8 \
+    --num_heads 8 \
+    --num_epochs 8 \
+    --lr 0.002 \
+    --maxlen 101 \
+    --temp 0.03 \
+    --amp
+```
+
+从 checkpoint 续训:
+
+```bash
+python main.py --state_dict_path /path/to/model.pt --num_epochs 20 ...
+```
+
+### 推理召回
+
+```bash
+python infer --batch_size 256 --hidden_units 128 --num_blocks 8 --num_heads 8
+```
+
+推理会依次:加载 checkpoint → 导出 query 与物品向量 → 调用 FAISS ANN → 输出每个用户的 Top-10 `creative_id`。
+
+---
+
+## 主要超参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--hidden_units` | 128 | 隐藏层维度 |
+| `--num_blocks` | 8 | Transformer 层数 |
+| `--num_heads` | 8 | 多头注意力头数 |
+| `--maxlen` | 101 | 序列最大长度 |
+| `--lr` | 0.002 | 学习率 |
+| `--num_epochs` | 8 | 训练轮数 |
+| `--temp` | 0.03 | InfoNCE 温度系数 |
+| `--dropout_rate` | 0.2 | Dropout |
+| `--warmup_steps` | 1000 | 学习率 warmup 步数 |
+| `--weight_decay` | 1e-6 | AdamW 权重衰减 |
+| `--clip_norm` | 1.0 | 梯度裁剪阈值 |
+| `--accum_steps` | 1 | 梯度累积步数 |
+| `--feat_session_gap` | 1800 | session 切分阈值(秒) |
+| `--mm_emb_id` | 81 | 使用的多模态 embedding 编号(可选 81~86) |
+| `--norm_first` | False | 是否使用 Pre-Norm |
+
+---
+
+## 实验结果
+
+> 可在此处补充线上 / 离线指标(如 Recall@10、Hit Rate、NDCG、线上 CTR / CVR 等)。
+
+| 模型 | Recall@10 | NDCG@10 | 备注 |
+|---|---|---|---|
+| Baseline | - | - | 待补充 |
+| UniMixer(本方案) | - | - | 待补充 |
+
+---
+
+## 技术亮点
+
+<details>
+<summary><b>统一用户-物品序列建模</b></summary>
+
+传统做法把用户画像和行为序列分别编码再拼接;本方案将用户特征与物品交互交错插入同一条序列,用 `token_type` 标记 token 归属(1 = 物品,2 = 用户),由 Transformer 自注意力统一建模两者交互,省去额外的融合网络。
+</details>
+
+<details>
+<summary><b>混合 Easy + Hard 负采样 + LogQ 校正</b></summary>
+
+- **Easy Negative**:随机采样的物品,提供大量负信号
+- **Hard Negative**:in-batch 其它用户的正样本,提供高难度负信号
+- 两者 1 : 1 拼接进 logits,经 `cross_entropy` 学到更鲁棒的表征
+- **LogQ 校正**:从 logits 中减去 `log(物品流行度)`,抵消采样偏差,逼近全量 softmax
+</details>
+
+<details>
+<summary><b>贝叶斯平滑 CTR 特征</b></summary>
+
+从原始曝光-点击日志统计每个用户 / 物品的点击率,用 Beta 分布先验做贝叶斯平滑(自动估计 α / β),得到稳健的连续特征 `u_smooth_ctr` / `i_smooth_ctr`,缓解低曝光物品的 CTR 估计抖动。
+</details>
+
+<details>
+<summary><b>时间上下文建模</b></summary>
+
+- **周期性**:对小时 / 星期做 sin / cos 编码,保留循环连续性
+- **间隔性**:`log1p` 压缩的时间间隔特征
+- **会话性**:按 `session_gap` 切分 session,记录 session 内位置
+- **离散桶**:小时 / 星期 / 月 / 周 / 年 / 时段 / 周末各建独立 embedding 表
+</details>
+
+---
+
+## 致谢
+
+- 赛题:[腾讯广告算法大赛(TAAC)](https://taac.tencent.com/)
+- 序列推荐主干参考 [SASRec](https://arxiv.org/abs/1808.09781)
+- 负采样校正参考 Sampled Softmax / LogQ Correction
+- 向量召回使用 [FAISS](https://github.com/facebookresearch/faiss)
+
+<div align="center">
+
+如果这个项目对你有帮助,欢迎 Star 支持
+
+</div>
